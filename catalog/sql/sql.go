@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"iter"
 	"maps"
-	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -60,6 +59,11 @@ const (
 	DialectKey           = "sql.dialect"
 	DriverKey            = "sql.driver"
 	initCatalogTablesKey = "init_catalog_tables"
+)
+
+const (
+	TableType = "TABLE"
+	ViewType  = "VIEW"
 )
 
 func init() {
@@ -134,6 +138,7 @@ type sqlIcebergTable struct {
 	CatalogName              string `bun:",pk"`
 	TableNamespace           string `bun:",pk"`
 	TableName                string `bun:",pk"`
+	IcebergType              string // TableType or ViewType
 	MetadataLocation         sql.NullString
 	PreviousMetadataLocation sql.NullString
 }
@@ -258,31 +263,6 @@ func (c *Catalog) namespaceExists(ctx context.Context, ns string) (bool, error) 
 	})
 }
 
-func (c *Catalog) getDefaultWarehouseLocation(ctx context.Context, nsname, tableName string) (string, error) {
-	dbprops, err := c.LoadNamespaceProperties(ctx, strings.Split(nsname, "."))
-	if err != nil {
-		return "", err
-	}
-
-	if dblocation := dbprops.Get("location", ""); dblocation != "" {
-		return url.JoinPath(dblocation, tableName)
-	}
-
-	if warehousepath := c.props.Get("warehouse", ""); warehousepath != "" {
-		return url.JoinPath(warehousepath, nsname+".db", tableName)
-	}
-
-	return "", errors.New("no default path set, please specify a location when creating a table")
-}
-
-func (c *Catalog) resolveTableLocation(ctx context.Context, loc, nsname, tablename string) (string, error) {
-	if len(loc) == 0 {
-		return c.getDefaultWarehouseLocation(ctx, nsname, tablename)
-	}
-
-	return strings.TrimSuffix(loc, "/"), nil
-}
-
 func checkValidNamespace(ident table.Identifier) error {
 	if len(ident) < 1 {
 		return fmt.Errorf("%w: empty namespace identifier", catalog.ErrNoSuchNamespace)
@@ -292,9 +272,9 @@ func checkValidNamespace(ident table.Identifier) error {
 }
 
 func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *iceberg.Schema, opts ...catalog.CreateTableOpt) (*table.Table, error) {
-	var cfg catalog.CreateTableCfg
-	for _, opt := range opts {
-		opt(&cfg)
+	staged, err := internal.CreateStagedTable(ctx, c.props, c.LoadNamespaceProperties, ident, sc, opts...)
+	if err != nil {
+		return nil, err
 	}
 
 	nsIdent := catalog.NamespaceFromIdent(ident)
@@ -309,18 +289,16 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 		return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, ns)
 	}
 
-	loc, err := c.resolveTableLocation(ctx, cfg.Location, ns, tblIdent)
+	afs, err := staged.FS(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	metadataLocation := internal.GetMetadataLoc(loc, 0)
-	metadata, err := table.NewMetadata(sc, cfg.PartitionSpec, cfg.SortOrder, loc, cfg.Properties)
-	if err != nil {
-		return nil, err
+	wfs, ok := afs.(io.WriteFileIO)
+	if !ok {
+		return nil, errors.New("loaded filesystem IO does not support writing")
 	}
 
-	if err := internal.WriteMetadata(ctx, metadata, metadataLocation, c.props); err != nil {
+	if err := internal.WriteTableMetadata(staged.Metadata(), wfs, staged.MetadataLocation()); err != nil {
 		return nil, err
 	}
 
@@ -329,7 +307,8 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 			CatalogName:      c.name,
 			TableNamespace:   ns,
 			TableName:        tblIdent,
-			MetadataLocation: sql.NullString{String: metadataLocation, Valid: true},
+			MetadataLocation: sql.NullString{String: staged.MetadataLocation(), Valid: true},
+			IcebergType:      TableType,
 		}).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
@@ -341,54 +320,7 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 		return nil, err
 	}
 
-	return c.LoadTable(ctx, ident, cfg.Properties)
-}
-
-func (c *Catalog) updateAndStageTable(ctx context.Context, current *table.Table, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (*table.StagedTable, error) {
-	var (
-		baseMeta    table.Metadata
-		metadataLoc string
-	)
-
-	if current != nil {
-		for _, r := range reqs {
-			if err := r.Validate(current.Metadata()); err != nil {
-				return nil, err
-			}
-		}
-
-		baseMeta = current.Metadata()
-		metadataLoc = current.MetadataLocation()
-	} else {
-		var err error
-		baseMeta, err = table.NewMetadata(iceberg.NewSchema(0), nil, table.UnsortedSortOrder, "", nil)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	updated, err := internal.UpdateTableMetadata(baseMeta, updates, metadataLoc)
-	if err != nil {
-		return nil, err
-	}
-
-	provider, err := table.LoadLocationProvider(updated.Location(), updated.Properties())
-	if err != nil {
-		return nil, err
-	}
-
-	newVersion := internal.ParseMetadataVersion(metadataLoc) + 1
-	newLocation, err := provider.NewTableMetadataFileLocation(newVersion)
-	if err != nil {
-		return nil, err
-	}
-
-	fs, err := io.LoadFS(ctx, updated.Properties(), newLocation)
-	if err != nil {
-		return nil, err
-	}
-
-	return &table.StagedTable{Table: table.New(ident, updated, newLocation, fs, c)}, nil
+	return c.LoadTable(ctx, ident, staged.Properties())
 }
 
 func (c *Catalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
@@ -400,7 +332,7 @@ func (c *Catalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []tabl
 		return nil, "", err
 	}
 
-	staged, err := c.updateAndStageTable(ctx, current, tbl.Identifier(), reqs, updates)
+	staged, err := internal.UpdateAndStageTable(ctx, current, tbl.Identifier(), reqs, updates, c)
 	if err != nil {
 		return nil, "", err
 	}
@@ -420,9 +352,11 @@ func (c *Catalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []tabl
 				CatalogName:              c.name,
 				TableNamespace:           strings.Join(ns, "."),
 				TableName:                tblName,
+				IcebergType:              TableType,
 				MetadataLocation:         sql.NullString{Valid: true, String: staged.MetadataLocation()},
 				PreviousMetadataLocation: sql.NullString{Valid: true, String: current.MetadataLocation()},
 			}).WherePK().Where("metadata_location = ?", current.MetadataLocation()).
+				Where("iceberg_type = ?", TableType).
 				Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("error updating table information: %w", err)
@@ -444,6 +378,7 @@ func (c *Catalog) CommitTable(ctx context.Context, tbl *table.Table, reqs []tabl
 			CatalogName:      c.name,
 			TableNamespace:   strings.Join(ns, "."),
 			TableName:        tblName,
+			IcebergType:      TableType,
 			MetadataLocation: sql.NullString{Valid: true, String: staged.MetadataLocation()},
 		}).Exec(ctx)
 		if err != nil {
@@ -495,12 +430,13 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier, pr
 	tblProps := maps.Clone(c.props)
 	maps.Copy(props, tblProps)
 
-	iofs, err := io.LoadFS(ctx, tblProps, result.MetadataLocation.String)
-	if err != nil {
-		return nil, err
-	}
-
-	return table.NewFromLocation(identifier, result.MetadataLocation.String, iofs, c)
+	return table.NewFromLocation(
+		ctx,
+		identifier,
+		result.MetadataLocation.String,
+		io.LoadFSFunc(tblProps, result.MetadataLocation.String),
+		c,
+	)
 }
 
 func (c *Catalog) DropTable(ctx context.Context, identifier table.Identifier) error {
@@ -512,7 +448,7 @@ func (c *Catalog) DropTable(ctx context.Context, identifier table.Identifier) er
 			CatalogName:    c.name,
 			TableNamespace: ns,
 			TableName:      tbl,
-		}).WherePK().Exec(ctx)
+		}).WherePK().Where("iceberg_type = ?", TableType).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to delete table entry: %w", err)
 		}
@@ -563,7 +499,7 @@ func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 			CatalogName:    c.name,
 			TableNamespace: fromNs,
 			TableName:      fromTbl,
-		}).WherePK().
+		}).WherePK().Where("iceberg_type = ?", TableType).
 			Set("table_namespace = ?", toNs).
 			Set("table_name = ?", toTbl).
 			Exec(ctx)
@@ -587,6 +523,19 @@ func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 	}
 
 	return c.LoadTable(ctx, to, nil)
+}
+
+func (c *Catalog) CheckTableExists(ctx context.Context, identifier table.Identifier) (bool, error) {
+	_, err := c.LoadTable(ctx, identifier, nil)
+	if err != nil {
+		if errors.Is(err, catalog.ErrNoSuchTable) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return true, nil
 }
 
 func (c *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifier, props iceberg.Properties) error {
@@ -740,6 +689,7 @@ func (c *Catalog) listTablesAll(ctx context.Context, namespace table.Identifier)
 		err := tx.NewSelect().Model(&tables).
 			Where("catalog_name = ?", c.name).
 			Where("table_namespace = ?", ns).
+			Where("iceberg_type = ?", TableType).
 			Scan(ctx)
 
 		return tables, err
@@ -870,4 +820,234 @@ func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table
 
 		return nil
 	})
+}
+
+func (c *Catalog) CheckNamespaceExists(ctx context.Context, namespace table.Identifier) (bool, error) {
+	return c.namespaceExists(ctx, strings.Join(namespace, "."))
+}
+
+// CreateView creates a new view in the catalog.
+func (c *Catalog) CreateView(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, viewSQL string, props iceberg.Properties) error {
+	nsIdent := catalog.NamespaceFromIdent(identifier)
+	viewIdent := catalog.TableNameFromIdent(identifier)
+	ns := strings.Join(nsIdent, ".")
+
+	exists, err := c.namespaceExists(ctx, ns)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, ns)
+	}
+
+	exists, err = c.CheckViewExists(ctx, identifier)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("%w: %s", catalog.ErrViewAlreadyExists, identifier)
+	}
+
+	loc, err := internal.ResolveTableLocation(ctx, "", ns, viewIdent, c.props, c.LoadNamespaceProperties)
+	if err != nil {
+		return err
+	}
+
+	metadataLocation, err := internal.CreateViewMetadata(ctx, c.name, nsIdent, schema, viewSQL, loc, props)
+	if err != nil {
+		return err
+	}
+	err = withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
+		_, err := tx.NewInsert().Model(&sqlIcebergTable{
+			CatalogName:      c.name,
+			TableNamespace:   ns,
+			TableName:        viewIdent,
+			IcebergType:      ViewType,
+			MetadataLocation: sql.NullString{String: metadataLocation, Valid: true},
+		}).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create view: %w", err)
+		}
+
+		return nil
+	})
+
+	return err
+}
+
+// ListViews returns a list of view identifiers in the catalog.
+func (c *Catalog) ListViews(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error] {
+	views, err := c.listViewsAll(ctx, namespace)
+	if err != nil {
+		return func(yield func(table.Identifier, error) bool) {
+			yield(table.Identifier{}, err)
+		}
+	}
+
+	return func(yield func(table.Identifier, error) bool) {
+		for _, v := range views {
+			if !yield(v, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (c *Catalog) listViewsAll(ctx context.Context, namespace table.Identifier) ([]table.Identifier, error) {
+	if len(namespace) > 0 {
+		exists, err := c.namespaceExists(ctx, strings.Join(namespace, "."))
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, strings.Join(namespace, "."))
+		}
+	}
+
+	ns := strings.Join(namespace, ".")
+	views, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) ([]sqlIcebergTable, error) {
+		var views []sqlIcebergTable
+		err := tx.NewSelect().Model(&views).
+			Where("catalog_name = ?", c.name).
+			Where("table_namespace = ?", ns).
+			Where("iceberg_type = ?", ViewType).
+			Scan(ctx)
+
+		return views, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error listing views for namespace '%s': %w", namespace, err)
+	}
+
+	ret := make([]table.Identifier, len(views))
+	for i, v := range views {
+		ret[i] = append(strings.Split(v.TableNamespace, "."), v.TableName)
+	}
+
+	return ret, nil
+}
+
+// DropView deletes a view from the catalog.
+func (c *Catalog) DropView(ctx context.Context, identifier table.Identifier) error {
+	ns := strings.Join(catalog.NamespaceFromIdent(identifier), ".")
+	viewName := catalog.TableNameFromIdent(identifier)
+
+	metadataLocation := ""
+	view, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
+		v := new(sqlIcebergTable)
+		err := tx.NewSelect().Model(v).
+			Where("catalog_name = ?", c.name).
+			Where("table_namespace = ?", ns).
+			Where("table_name = ?", viewName).
+			Where("iceberg_type = ?", ViewType).
+			Scan(ctx)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error encountered loading view %s: %w", identifier, err)
+		}
+
+		return v, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if view.MetadataLocation.Valid {
+		metadataLocation = view.MetadataLocation.String
+	}
+
+	err = withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
+		res, err := tx.NewDelete().Model(&sqlIcebergTable{
+			CatalogName:    c.name,
+			TableNamespace: ns,
+			TableName:      viewName,
+		}).WherePK().Where("iceberg_type = ?", ViewType).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to delete view entry: %w", err)
+		}
+
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("error encountered when deleting view entry: %w", err)
+		}
+
+		if n == 0 {
+			return fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if metadataLocation != "" {
+		fs, err := io.LoadFS(ctx, c.props, metadataLocation)
+		if err != nil {
+			return nil
+		}
+
+		_ = fs.Remove(metadataLocation)
+	}
+
+	return nil
+}
+
+// CheckViewExists returns true if a view exists in the catalog.
+func (c *Catalog) CheckViewExists(ctx context.Context, identifier table.Identifier) (bool, error) {
+	ns := strings.Join(catalog.NamespaceFromIdent(identifier), ".")
+	viewName := catalog.TableNameFromIdent(identifier)
+
+	return withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (bool, error) {
+		exists, err := tx.NewSelect().Model(&sqlIcebergTable{
+			CatalogName:    c.name,
+			TableNamespace: ns,
+			TableName:      viewName,
+		}).WherePK().Where("iceberg_type = ?", ViewType).Exists(ctx)
+		if err != nil {
+			return false, fmt.Errorf("error checking view existence: %w", err)
+		}
+
+		return exists, nil
+	})
+}
+
+// LoadView loads a view from the catalog.
+func (c *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (map[string]interface{}, error) {
+	ns := strings.Join(catalog.NamespaceFromIdent(identifier), ".")
+	viewName := catalog.TableNameFromIdent(identifier)
+
+	view, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
+		v := new(sqlIcebergTable)
+		err := tx.NewSelect().Model(v).
+			Where("catalog_name = ?", c.name).
+			Where("table_namespace = ?", ns).
+			Where("table_name = ?", viewName).
+			Where("iceberg_type = ?", ViewType).
+			Scan(ctx)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error encountered loading view %s: %w", identifier, err)
+		}
+
+		return v, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if !view.MetadataLocation.Valid {
+		return nil, fmt.Errorf("%w: %s, metadata location is missing", catalog.ErrNoSuchView, identifier)
+	}
+
+	viewMetadata, err := internal.LoadViewMetadata(ctx, c.props, view.MetadataLocation.String, viewName, ns)
+	if err != nil {
+		return nil, err
+	}
+
+	return viewMetadata, nil
 }
