@@ -17,12 +17,14 @@
 
 //go:build integration
 
-package rest_test
+package sql_test
 
 import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -30,42 +32,68 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/catalog/rest"
+	"github.com/apache/iceberg-go/catalog/sql"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
-	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
-type RestIntegrationSuite struct {
+type SQLIntegrationSuite struct {
 	suite.Suite
 
 	ctx context.Context
-	cat *rest.Catalog
+	cat *sql.Catalog
+	dir string
 }
 
-const TestNamespaceIdent = "TEST NS"
+const (
+	TestNamespaceIdent = "TEST_NS"
+	location           = "s3://warehouse/iceberg"
+)
 
-func (s *RestIntegrationSuite) loadCatalog(ctx context.Context) *rest.Catalog {
+var tableSchemaSimple = iceberg.NewSchemaWithIdentifiers(1, []int{2},
+	iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: false},
+	iceberg.NestedField{ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false},
+)
+
+func (s *SQLIntegrationSuite) loadCatalog(ctx context.Context) *sql.Catalog {
+	// Create a temp dir for SQLite database
+	var err error
+	s.dir, err = os.MkdirTemp("", "iceberg-sql-test-*")
+	s.Require().NoError(err)
+
+	// Create catalog
+	dbPath := filepath.Join(s.dir, "iceberg-catalog.db")
 	cat, err := catalog.Load(ctx, "local", iceberg.Properties{
-		"type":               "rest",
-		"uri":                "http://localhost:8181",
+		"type":               "sql",
+		"uri":                "file:" + dbPath,
+		"sql.dialect":        "sqlite",
+		"sql.driver":         "sqlite",
 		io.S3Region:          "us-east-1",
 		io.S3AccessKeyID:     "admin",
 		io.S3SecretAccessKey: "password",
+		"warehouse":          location,
 	})
 	s.Require().NoError(err)
-	s.Require().IsType(&rest.Catalog{}, cat)
-	return cat.(*rest.Catalog)
+	s.Require().IsType(&sql.Catalog{}, cat)
+
+	return cat.(*sql.Catalog)
 }
 
-func (s *RestIntegrationSuite) SetupTest() {
+func (s *SQLIntegrationSuite) SetupTest() {
 	s.ctx = context.Background()
 	s.cat = s.loadCatalog(s.ctx)
 }
 
+func (s *SQLIntegrationSuite) TearDownTest() {
+	if s.dir != "" {
+		os.RemoveAll(s.dir)
+	}
+}
+
 var (
-	tableSchemaNested = iceberg.NewSchemaWithIdentifiers(1,
+	tableSchemaNestedTest = iceberg.NewSchemaWithIdentifiers(1,
 		[]int{1},
 		iceberg.NestedField{
 			ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: true},
@@ -116,7 +144,7 @@ var (
 	)
 )
 
-func (s *RestIntegrationSuite) ensureNamespace() {
+func (s *SQLIntegrationSuite) ensureNamespace() {
 	exists, err := s.cat.CheckNamespaceExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent))
 	s.Require().NoError(err)
 	if exists {
@@ -127,7 +155,7 @@ func (s *RestIntegrationSuite) ensureNamespace() {
 		iceberg.Properties{"foo": "bar", "prop": "yes"}))
 }
 
-func (s *RestIntegrationSuite) TestCreateNamespace() {
+func (s *SQLIntegrationSuite) TestCreateNamespace() {
 	exists, err := s.cat.CheckNamespaceExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent))
 	s.Require().NoError(err)
 	if exists {
@@ -138,7 +166,7 @@ func (s *RestIntegrationSuite) TestCreateNamespace() {
 	s.NoError(s.cat.DropNamespace(s.ctx, catalog.ToIdentifier(TestNamespaceIdent)))
 }
 
-func (s *RestIntegrationSuite) TestLoadNamespaceProps() {
+func (s *SQLIntegrationSuite) TestLoadNamespaceProps() {
 	s.ensureNamespace()
 
 	props, err := s.cat.LoadNamespaceProperties(s.ctx, catalog.ToIdentifier(TestNamespaceIdent))
@@ -148,7 +176,7 @@ func (s *RestIntegrationSuite) TestLoadNamespaceProps() {
 	s.Equal("yes", props["prop"])
 }
 
-func (s *RestIntegrationSuite) TestUpdateNamespaceProps() {
+func (s *SQLIntegrationSuite) TestUpdateNamespaceProps() {
 	s.ensureNamespace()
 
 	summary, err := s.cat.UpdateNamespaceProperties(s.ctx, catalog.ToIdentifier(TestNamespaceIdent),
@@ -161,10 +189,8 @@ func (s *RestIntegrationSuite) TestUpdateNamespaceProps() {
 	}, summary)
 }
 
-func (s *RestIntegrationSuite) TestCreateTable() {
+func (s *SQLIntegrationSuite) TestCreateTable() {
 	s.ensureNamespace()
-
-	const location = "s3://warehouse/iceberg"
 
 	tbl, err := s.cat.CreateTable(s.ctx,
 		catalog.ToIdentifier(TestNamespaceIdent, "test-table"),
@@ -183,10 +209,9 @@ func (s *RestIntegrationSuite) TestCreateTable() {
 	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table")))
 }
 
-func (s *RestIntegrationSuite) TestCreateView() {
+func (s *SQLIntegrationSuite) TestCreateView() {
 	s.ensureNamespace()
 
-	const location = "s3://warehouse/iceberg"
 	// create a table first
 	tbl, err := s.cat.CreateTable(s.ctx,
 		catalog.ToIdentifier(TestNamespaceIdent, "test-table"),
@@ -203,7 +228,7 @@ func (s *RestIntegrationSuite) TestCreateView() {
 	s.True(exists)
 
 	// Create a view
-	viewSQL := fmt.Sprintf("SELECT * FROM  %s.%s", TestNamespaceIdent, "test-table")
+	viewSQL := fmt.Sprintf("SELECT * FROM %s.%s", TestNamespaceIdent, "test-table")
 
 	err = s.cat.CreateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"), tableSchemaSimple, viewSQL, iceberg.Properties{"foobar": "baz"})
 	s.Require().NoError(err)
@@ -216,14 +241,12 @@ func (s *RestIntegrationSuite) TestCreateView() {
 	s.Require().NoError(s.cat.DropView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view")))
 }
 
-func (s *RestIntegrationSuite) TestWriteCommitTable() {
+func (s *SQLIntegrationSuite) TestWriteCommitTable() {
 	s.ensureNamespace()
-
-	const location = "s3://warehouse/iceberg"
 
 	tbl, err := s.cat.CreateTable(s.ctx,
 		catalog.ToIdentifier(TestNamespaceIdent, "test-table-2"),
-		tableSchemaNested, catalog.WithLocation(location))
+		tableSchemaNestedTest, catalog.WithLocation(location))
 	s.Require().NoError(err)
 	s.Require().NotNil(tbl)
 
@@ -233,7 +256,7 @@ func (s *RestIntegrationSuite) TestWriteCommitTable() {
 
 	s.Equal(location, tbl.Location())
 
-	arrSchema, err := table.SchemaToArrowSchema(tableSchemaNested, nil, false, false)
+	arrSchema, err := table.SchemaToArrowSchema(tableSchemaNestedTest, nil, false, false)
 	s.Require().NoError(err)
 
 	table, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema,
@@ -255,11 +278,16 @@ func (s *RestIntegrationSuite) TestWriteCommitTable() {
 	pqfile, err := url.JoinPath(location, "data", "test_commit_table_data", "test.parquet")
 	s.Require().NoError(err)
 
-	fw, err := mustFS(s.T(), tbl).(io.WriteFileIO).Create(pqfile)
+	fs, err := tbl.FS(s.ctx)
+	s.Require().NoError(err)
+	fw, err := fs.(io.WriteFileIO).Create(pqfile)
 	s.Require().NoError(err)
 	s.Require().NoError(pqarrow.WriteTable(table, fw, table.NumRows(),
 		nil, pqarrow.DefaultWriterProps()))
-	defer mustFS(s.T(), tbl).Remove(pqfile)
+	defer func(fs io.IO, name string) {
+		err = fs.Remove(name)
+		s.Require().NoError(err)
+	}(fs, pqfile)
 
 	txn := tbl.NewTransaction()
 	s.Require().NoError(txn.AddFiles(s.ctx, []string{pqfile}, nil, false))
@@ -275,19 +303,16 @@ func (s *RestIntegrationSuite) TestWriteCommitTable() {
 
 	s.Len(mf, 1)
 	s.EqualValues(1, mf[0].AddedDataFiles())
-	entries, err := mf[0].FetchEntries(mustFS(s.T(), updated), false)
+	updatedFS, err := updated.FS(s.ctx)
+	s.Require().NoError(err)
+
+	entries, err := mf[0].FetchEntries(updatedFS, false)
 	s.Require().NoError(err)
 
 	s.Len(entries, 1)
 	s.Equal(pqfile, entries[0].DataFile().FilePath())
 }
 
-func mustFS(t *testing.T, tbl *table.Table) io.IO {
-	r, err := tbl.FS(context.Background())
-	require.NoError(t, err)
-	return r
-}
-
-func TestRestIntegration(t *testing.T) {
-	suite.Run(t, new(RestIntegrationSuite))
+func TestSQLIntegration(t *testing.T) {
+	suite.Run(t, new(SQLIntegrationSuite))
 }
