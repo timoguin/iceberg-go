@@ -19,8 +19,10 @@ package glue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -34,6 +36,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/glue/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/awsdocs/aws-doc-sdk-examples/gov2/testtools"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -96,6 +99,12 @@ func (m *mockGlueClient) UpdateDatabase(ctx context.Context, params *glue.Update
 	return args.Get(0).(*glue.UpdateDatabaseOutput), args.Error(1)
 }
 
+func (m *mockGlueClient) UpdateTable(ctx context.Context, params *glue.UpdateTableInput, optFns ...func(*glue.Options)) (*glue.UpdateTableOutput, error) {
+	args := m.Called(ctx, params, optFns)
+
+	return args.Get(0).(*glue.UpdateTableOutput), args.Error(1)
+}
+
 var testIcebergGlueTable1 = types.Table{
 	Name: aws.String("test_table"),
 	Parameters: map[string]string{
@@ -136,10 +145,36 @@ var testIcebergGlueTable5 = types.Table{
 	},
 }
 
+var testIcebergGlueTable6 = types.Table{
+	Name: aws.String("test_table6"),
+	Parameters: map[string]string{
+		tableTypePropsKey:        "iceberg",
+		metadataLocationPropsKey: "s3://test-bucket/test_table/metadata/abc123456-789.metadata.json",
+	},
+}
+
 var testNonIcebergGlueTable = types.Table{
 	Name: aws.String("other_table"),
 	Parameters: map[string]string{
 		metadataLocationPropsKey: "s3://test-bucket/other_table/",
+	},
+}
+
+var testSchema = iceberg.NewSchemaWithIdentifiers(0, []int{},
+	iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String},
+	iceberg.NestedField{ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool})
+
+var testPartitionSpec = iceberg.NewPartitionSpec(
+	iceberg.PartitionField{SourceID: 2, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+
+var testSortOrder = table.SortOrder{
+	OrderID: 1,
+	Fields: []table.SortField{
+		{
+			SourceID: 1, Transform: iceberg.IdentityTransform{},
+			Direction: table.SortASC, NullOrder: table.NullsLast,
+		},
 	},
 }
 
@@ -162,6 +197,53 @@ func TestGlueGetTable(t *testing.T) {
 	assert.Equal("s3://test-bucket/test_table/metadata/abc123-123.metadata.json", tbl.Parameters[metadataLocationPropsKey])
 }
 
+func TestGlueGetTableCaseInsensitive(t *testing.T) {
+	assert := require.New(t)
+
+	testCases := []struct {
+		name      string
+		tableType string
+		shouldErr bool
+	}{
+		{"uppercase", "ICEBERG", false},
+		{"lowercase", "iceberg", false},
+		{"mixed case", "IcEbErG", false},
+		{"non-iceberg", "HIVE", true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockGlueSvc := &mockGlueClient{}
+
+			testTable := types.Table{
+				Name: aws.String("test_table"),
+				Parameters: map[string]string{
+					tableTypePropsKey:        tc.tableType,
+					metadataLocationPropsKey: "s3://test-bucket/test_table/metadata/abc123-123.metadata.json",
+				},
+			}
+
+			mockGlueSvc.On("GetTable", mock.Anything, &glue.GetTableInput{
+				DatabaseName: aws.String("test_database"),
+				Name:         aws.String("test_table"),
+			}, mock.Anything).Return(&glue.GetTableOutput{Table: &testTable}, nil)
+
+			glueCatalog := &Catalog{
+				glueSvc: mockGlueSvc,
+			}
+
+			tbl, err := glueCatalog.getTable(context.TODO(), "test_database", "test_table")
+			if tc.shouldErr {
+				assert.Error(err)
+				assert.Contains(err.Error(), "is not an iceberg table")
+			} else {
+				assert.NoError(err)
+				assert.Equal("s3://test-bucket/test_table/metadata/abc123-123.metadata.json", tbl.Parameters[metadataLocationPropsKey])
+			}
+		})
+	}
+}
+
 func TestGlueListTables(t *testing.T) {
 	assert := require.New(t)
 
@@ -170,7 +252,7 @@ func TestGlueListTables(t *testing.T) {
 	mockGlueSvc.On("GetTables", mock.Anything, &glue.GetTablesInput{
 		DatabaseName: aws.String("test_database"),
 	}, mock.Anything).Return(&glue.GetTablesOutput{
-		TableList: []types.Table{testIcebergGlueTable1, testNonIcebergGlueTable},
+		TableList: []types.Table{testIcebergGlueTable1, testIcebergGlueTable6, testNonIcebergGlueTable},
 	}, nil).Once()
 
 	glueCatalog := &Catalog{
@@ -188,8 +270,9 @@ func TestGlueListTables(t *testing.T) {
 		}
 	}
 	assert.NoError(lastErr)
-	assert.Len(tbls, 1)
+	assert.Len(tbls, 2)
 	assert.Equal([]string{"test_database", "test_table"}, tbls[0])
+	assert.Equal([]string{"test_database", "test_table6"}, tbls[1])
 }
 
 func TestGlueListTablesPagination(t *testing.T) {
@@ -449,9 +532,8 @@ func TestGlueCheckNamespaceNotExists(t *testing.T) {
 	}
 
 	exists, err := glueCatalog.CheckNamespaceExists(context.TODO(), DatabaseIdentifier("nonexistent_namespace"))
-	assert.Error(err)
+	assert.Nil(err)
 	assert.False(exists)
-	assert.ErrorContains(err, "Database not found")
 }
 
 func TestGlueUpdateNamespaceProperties(t *testing.T) {
@@ -603,8 +685,6 @@ func TestGlueUpdateNamespaceProperties(t *testing.T) {
 }
 
 func TestGlueRenameTable(t *testing.T) {
-	t.Skip("Skipping this test temporarily because LoadTable is not testable due to the dependency on the IO.")
-
 	assert := require.New(t)
 
 	mockGlueSvc := &mockGlueClient{}
@@ -659,13 +739,35 @@ func TestGlueRenameTable(t *testing.T) {
 		Name:         aws.String("test_table"),
 	}, mock.Anything).Return(&glue.DeleteTableOutput{}, nil).Once()
 
+	// Setup S3 FS stubs to mimic reading json metadata file
+	stubber := testtools.NewStubber()
+	testMetadata, err := table.NewMetadata(
+		testSchema, &testPartitionSpec, testSortOrder, "s3://test-bucket/new_test_table/", nil)
+	assert.NoError(err)
+	strMeta, err := json.Marshal(testMetadata)
+	assert.NoError(err)
+
+	stubber.Add(testtools.Stub{
+		OperationName: "GetObject",
+		Input: &s3.GetObjectInput{
+			Bucket:       aws.String("test-bucket"),
+			Key:          aws.String("new_test_table/metadata/abc123-123.metadata.json"),
+			ChecksumMode: "ENABLED",
+		},
+		Output: &s3.GetObjectOutput{
+			Body: io.NopCloser(strings.NewReader(string(strMeta))),
+		},
+	})
+
 	glueCatalog := &Catalog{
 		glueSvc: mockGlueSvc,
+		awsCfg:  stubber.SdkConfig,
 	}
 
 	renamedTable, err := glueCatalog.RenameTable(context.TODO(), TableIdentifier("test_database", "test_table"), TableIdentifier("test_database", "new_test_table"))
 	assert.NoError(err)
 	assert.Equal("new_test_table", renamedTable.Identifier()[1])
+	assert.True(testSchema.Equals(renamedTable.Schema()))
 }
 
 func TestGlueRenameTable_DeleteTableFailureRollback(t *testing.T) {
@@ -741,17 +843,17 @@ func TestGlueListTablesIntegration(t *testing.T) {
 	ctlg := NewCatalog(WithAwsConfig(awsCfg))
 
 	iter := ctlg.ListTables(context.TODO(), DatabaseIdentifier(os.Getenv("TEST_DATABASE_NAME")))
-	var lastErr error
-	tbls := make([]table.Identifier, 0)
+
+	found := false
 	for tbl, err := range iter {
-		tbls = append(tbls, tbl)
-		if err != nil {
-			lastErr = err
+		assert.NoError(err)
+		if tbl[1] == os.Getenv("TEST_TABLE_NAME") {
+			found = true
+
+			break
 		}
 	}
-
-	assert.NoError(lastErr)
-	assert.Equal([]string{os.Getenv("TEST_DATABASE_NAME"), os.Getenv("TEST_TABLE_NAME")}, tbls[1])
+	assert.True(found, "expect test table name exists to be part of the list table results")
 }
 
 func TestGlueLoadTableIntegration(t *testing.T) {
@@ -774,7 +876,7 @@ func TestGlueLoadTableIntegration(t *testing.T) {
 
 	tbl, err := ctlg.LoadTable(context.TODO(), []string{os.Getenv("TEST_DATABASE_NAME"), os.Getenv("TEST_TABLE_NAME")}, nil)
 	assert.NoError(err)
-	assert.Equal([]string{os.Getenv("TEST_TABLE_NAME")}, tbl.Identifier())
+	assert.Equal([]string{os.Getenv("TEST_DATABASE_NAME"), os.Getenv("TEST_TABLE_NAME")}, tbl.Identifier())
 }
 
 func TestGlueListNamespacesIntegration(t *testing.T) {
@@ -812,44 +914,19 @@ func TestGlueCreateTableSuccessIntegration(t *testing.T) {
 	ctlg := NewCatalog(WithAwsConfig(awsCfg))
 	sourceTable, err := ctlg.LoadTable(context.TODO(), []string{dbName, sourceTableName}, nil)
 	assert.NoError(err)
-	assert.Equal([]string{sourceTableName}, sourceTable.Identifier())
+	assert.Equal([]string{dbName, sourceTableName}, sourceTable.Identifier())
 	newTableName := fmt.Sprintf("%d_%s", time.Now().UnixNano(), sourceTableName)
 	createOpts := []catalog.CreateTableOpt{
 		catalog.WithLocation(metadataLocation),
 	}
 	newTable, err := ctlg.CreateTable(context.TODO(), TableIdentifier(dbName, newTableName), sourceTable.Schema(), createOpts...)
-	defer func() {
-		cleanupErr := ctlg.DropTable(context.TODO(), TableIdentifier(dbName, newTableName))
-		if cleanupErr != nil {
-			t.Logf("Warning: Failed to clean up table %s.%s: %v", dbName, newTableName, cleanupErr)
-		}
-		// Clean up the newly created metadata file in S3
-		if newTable != nil {
-			s3Client := s3.NewFromConfig(awsCfg)
-			metadataLoc := newTable.MetadataLocation()
-			if strings.HasPrefix(metadataLoc, "s3://") {
-				parts := strings.SplitN(strings.TrimPrefix(metadataLoc, "s3://"), "/", 2)
-				if len(parts) == 2 {
-					bucket := parts[0]
-					key := parts[1]
-					_, deleteErr := s3Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
-						Bucket: aws.String(bucket),
-						Key:    aws.String(key),
-					})
-					if deleteErr != nil {
-						t.Logf("Warning: Failed to delete metadata file at %s: %v", metadataLoc, deleteErr)
-					}
-				}
-			}
-		}
-	}()
-	assert.True(false)
+	defer cleanupTable(t, ctlg, TableIdentifier(dbName, newTableName), awsCfg)
 	assert.NoError(err)
-	assert.Equal([]string{newTableName}, newTable.Identifier())
+	assert.Equal([]string{dbName, newTableName}, newTable.Identifier())
 
 	tableNewLoaded, err := ctlg.LoadTable(context.TODO(), []string{dbName, newTableName}, nil)
 	assert.NoError(err)
-	assert.Equal([]string{newTableName}, tableNewLoaded.Identifier())
+	assert.Equal([]string{dbName, newTableName}, tableNewLoaded.Identifier())
 	assert.Equal(sourceTable.Schema().Fields(), tableNewLoaded.Schema().Fields())
 	assert.Contains(tableNewLoaded.MetadataLocation(), metadataLocation)
 
@@ -888,7 +965,7 @@ func TestGlueCreateTableInvalidMetadataRollback(t *testing.T) {
 	assert.Error(err, "expected error when creating table with invalid metadata location")
 	_, err = ctlg.LoadTable(context.TODO(), []string{dbName, newTableName}, nil)
 	assert.Error(err, "expected table to not exist after failed creation")
-	assert.True(strings.Contains(err.Error(), "EntityNotFoundException: Entity Not Found"), "expected EntityNotFoundException error")
+	assert.True(strings.Contains(err.Error(), "table does not exist"), "expected EntityNotFoundException error")
 	// Verify that the table was not left in the catalog
 	tablesIter := ctlg.ListTables(context.TODO(), DatabaseIdentifier(dbName)) // TODO: Implement CheckTableExists
 	found := false
@@ -981,4 +1058,255 @@ func TestRegisterTableIntegration(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal([]string{tableName}, tbl.Identifier())
 	assert.Equal(metadataLocation, tbl.MetadataLocation())
+}
+
+func TestAlterTableIntegration(t *testing.T) {
+	if os.Getenv("TEST_DATABASE_NAME") == "" {
+		t.Skip()
+	}
+	if os.Getenv("TEST_TABLE_LOCATION") == "" {
+		t.Skip()
+	}
+
+	assert := require.New(t)
+	dbName := os.Getenv("TEST_DATABASE_NAME")
+	metadataLocation := os.Getenv("TEST_TABLE_LOCATION")
+	tbName := fmt.Sprintf("table_%d", time.Now().UnixNano())
+	tbIdent := TableIdentifier(dbName, tbName)
+	schema := iceberg.NewSchemaWithIdentifiers(0, []int{},
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool})
+
+	awsCfg, err := config.LoadDefaultConfig(context.TODO(), config.WithClientLogMode(aws.LogRequest|aws.LogResponse))
+	assert.NoError(err)
+	ctlg := NewCatalog(WithAwsConfig(awsCfg))
+
+	// Create a table within the input database and location
+	testProps := iceberg.Properties{
+		"write.parquet.compression-codec": "zstd",
+	}
+	createOpts := []catalog.CreateTableOpt{
+		catalog.WithLocation(metadataLocation),
+		catalog.WithProperties(testProps),
+	}
+	_, err = ctlg.CreateTable(context.TODO(), tbIdent, schema, createOpts...)
+	assert.NoError(err)
+
+	testTable, err := ctlg.LoadTable(context.TODO(), tbIdent, nil)
+	assert.NoError(err)
+	assert.Equal(testProps, testTable.Properties())
+	assert.True(schema.Equals(testTable.Schema()))
+
+	// Clean up table and table location after tests
+	defer cleanupTable(t, ctlg, tbIdent, awsCfg)
+
+	// Test set table properties
+	updateProps := table.NewSetPropertiesUpdate(map[string]string{
+		"read.split.target-size": "134217728",
+		"key":                    "val",
+	})
+	_, _, err = ctlg.CommitTable(
+		context.TODO(),
+		testTable,
+		nil,
+		[]table.Update{updateProps},
+	)
+	assert.NoError(err)
+	testTable, err = ctlg.LoadTable(context.TODO(), tbIdent, nil)
+	assert.NoError(err)
+	assert.Equal(iceberg.Properties{
+		"write.parquet.compression-codec": "zstd",
+		"read.split.target-size":          "134217728",
+		"key":                             "val",
+	}, testTable.Properties())
+
+	// Test unset table properties
+	removeProps := table.NewRemovePropertiesUpdate([]string{"key"})
+	_, _, err = ctlg.CommitTable(
+		context.TODO(),
+		testTable,
+		nil,
+		[]table.Update{removeProps},
+	)
+	assert.NoError(err)
+	testTable, err = ctlg.LoadTable(context.TODO(), tbIdent, nil)
+	assert.NoError(err)
+	assert.Equal(iceberg.Properties{
+		"write.parquet.compression-codec": "zstd",
+		"read.split.target-size":          "134217728",
+	}, testTable.Properties())
+
+	// Test Alter Table Add / Drop Column
+	currentSchema := testTable.Schema()
+	newSchemaId := currentSchema.ID + 1
+	addField := iceberg.NestedField{
+		ID:       currentSchema.HighestFieldID() + 1,
+		Name:     "new_col",
+		Type:     iceberg.PrimitiveTypes.String,
+		Required: false,
+	}
+	newFields := append(currentSchema.Fields(), addField) // add column 'new_col'
+	newFields = append(newFields[:1], newFields[2:]...)   // drop column 'bar'
+	updateColumns := table.NewAddSchemaUpdate(
+		iceberg.NewSchemaWithIdentifiers(newSchemaId, currentSchema.IdentifierFieldIDs, newFields...),
+		addField.ID,
+		false,
+	)
+	setSchema := table.NewSetCurrentSchemaUpdate(newSchemaId)
+
+	_, _, err = ctlg.CommitTable(
+		context.TODO(),
+		testTable,
+		nil,
+		[]table.Update{updateColumns, setSchema},
+	)
+	assert.NoError(err)
+	testTable, err = ctlg.LoadTable(context.TODO(), tbIdent, nil)
+	assert.NoError(err)
+	assert.Equal(newFields, testTable.Schema().Fields())
+}
+
+func TestSnapshotManagementIntegration(t *testing.T) {
+	if os.Getenv("TEST_DATABASE_NAME") == "" || os.Getenv("TEST_TABLE_LOCATION") == "" {
+		t.Skip()
+	}
+
+	assert := require.New(t)
+	dbName := os.Getenv("TEST_DATABASE_NAME")
+	tbLocation := os.Getenv("TEST_TABLE_LOCATION")
+	tbName := fmt.Sprintf("table_%d", time.Now().UnixNano())
+	tbIdent := TableIdentifier(dbName, tbName)
+
+	awsCfg, err := config.LoadDefaultConfig(context.TODO(), config.WithClientLogMode(aws.LogRequest|aws.LogResponse))
+	assert.NoError(err)
+	ctlg := NewCatalog(WithAwsConfig(awsCfg))
+
+	// clean up table after test
+	defer cleanupTable(t, ctlg, tbIdent, awsCfg)
+
+	createOpts := []catalog.CreateTableOpt{
+		catalog.WithLocation(tbLocation),
+	}
+	_, err = ctlg.CreateTable(context.TODO(), tbIdent, testSchema, createOpts...)
+	assert.NoError(err)
+
+	testTable, err := ctlg.LoadTable(context.TODO(), tbIdent, nil)
+	assert.NoError(err)
+
+	// Test add new snapshot
+	manifest, schemaid := "s3:/a/b/c.avro", 3
+	newSnap := table.Snapshot{
+		SnapshotID:     25,
+		SequenceNumber: 200,
+		TimestampMs:    1602638573590,
+		ManifestList:   manifest,
+		SchemaID:       &schemaid,
+		Summary: &table.Summary{
+			Operation: table.OpAppend,
+		},
+	}
+
+	_, _, err = ctlg.CommitTable(context.TODO(), testTable, nil, []table.Update{
+		table.NewAddSnapshotUpdate(&newSnap),
+	})
+	assert.NoError(err)
+
+	testTable, err = ctlg.LoadTable(context.TODO(), tbIdent, nil)
+	assert.NoError(err)
+
+	actualSnap := testTable.SnapshotByID(25)
+	assert.Equal(newSnap.SnapshotID, actualSnap.SnapshotID)
+	assert.Equal(newSnap.ParentSnapshotID, actualSnap.ParentSnapshotID)
+	assert.Equal(newSnap.SequenceNumber, actualSnap.SequenceNumber)
+	assert.Equal(newSnap.ManifestList, actualSnap.ManifestList)
+	assert.Equal(newSnap.TimestampMs, actualSnap.TimestampMs)
+	assert.Equal(*newSnap.SchemaID, *actualSnap.SchemaID)
+	assert.Equal(newSnap.Summary.Operation, actualSnap.Summary.Operation)
+
+	// Test update current snapshot
+	_, _, err = ctlg.CommitTable(context.TODO(), testTable, nil, []table.Update{
+		table.NewSetSnapshotRefUpdate(table.MainBranch, 25, table.BranchRef,
+			-1, -1, -1),
+	})
+	assert.NoError(err)
+
+	testTable, err = ctlg.LoadTable(context.TODO(), tbIdent, nil)
+	assert.NoError(err)
+
+	currSnap := testTable.CurrentSnapshot()
+	assert.Equal(newSnap.SnapshotID, currSnap.SnapshotID)
+	assert.Equal(newSnap.ParentSnapshotID, actualSnap.ParentSnapshotID)
+	assert.Equal(newSnap.SequenceNumber, currSnap.SequenceNumber)
+	assert.Equal(newSnap.ManifestList, currSnap.ManifestList)
+	assert.Equal(newSnap.TimestampMs, currSnap.TimestampMs)
+	assert.Equal(*newSnap.SchemaID, *currSnap.SchemaID)
+	assert.Equal(newSnap.Summary.Operation, currSnap.Summary.Operation)
+}
+
+func TestGlueCheckTableExists(t *testing.T) {
+	assert := require.New(t)
+	mockGlueSvc := &mockGlueClient{}
+	mockGlueSvc.On("GetTable", mock.Anything, &glue.GetTableInput{
+		DatabaseName: aws.String("test_database"),
+		Name:         aws.String("test_table"),
+	}, mock.Anything).Return(&glue.GetTableOutput{Table: &testIcebergGlueTable1}, nil).Once()
+	glueCatalog := &Catalog{
+		glueSvc: mockGlueSvc,
+	}
+	exists, err := glueCatalog.CheckTableExists(context.TODO(), TableIdentifier("test_database", "test_table"))
+	assert.NoError(err)
+	assert.True(exists)
+}
+
+func TestGlueCheckTableNotExists(t *testing.T) {
+	assert := require.New(t)
+	mockGlueSvc := &mockGlueClient{}
+
+	mockGlueSvc.On("GetTable", mock.Anything, &glue.GetTableInput{
+		DatabaseName: aws.String("test_database"),
+		Name:         aws.String("nonexistent_table"),
+	}, mock.Anything).Return(&glue.GetTableOutput{},
+		&types.EntityNotFoundException{}).Once()
+
+	glueCatalog := &Catalog{
+		glueSvc: mockGlueSvc,
+	}
+
+	exists, err := glueCatalog.CheckTableExists(context.TODO(), TableIdentifier("test_database", "nonexistent_table"))
+	assert.Nil(err)
+	assert.False(exists)
+}
+
+func cleanupTable(t *testing.T, ctlg catalog.Catalog, tbIdent table.Identifier, awsCfg aws.Config) {
+	t.Helper()
+
+	testTable, err := ctlg.LoadTable(context.TODO(), tbIdent, nil)
+	if err != nil {
+		t.Logf("Warning: Failed to load table %s: %v", tbIdent, err)
+	}
+
+	cleanupErr := ctlg.DropTable(context.TODO(), tbIdent)
+	if cleanupErr != nil {
+		t.Logf("Warning: Failed to clean up table %s: %v", tbIdent, cleanupErr)
+	}
+
+	if testTable != nil {
+		s3Client := s3.NewFromConfig(awsCfg)
+		metadataLoc := testTable.MetadataLocation()
+		if strings.HasPrefix(metadataLoc, "s3://") {
+			parts := strings.SplitN(strings.TrimPrefix(metadataLoc, "s3://"), "/", 2)
+			if len(parts) == 2 {
+				bucket := parts[0]
+				key := parts[1]
+				_, deleteErr := s3Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(key),
+				})
+				if deleteErr != nil {
+					t.Logf("Warning: Failed to delete metadata file at %s: %v", metadataLoc, deleteErr)
+				}
+			}
+		}
+	}
 }
